@@ -1,8 +1,9 @@
 """Simple UI: add folders, run backup + auto-crop + blank page removal."""
+import os
 import queue
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import processor
 
@@ -20,7 +21,7 @@ class App(tk.Tk):
         self.blank_var = tk.BooleanVar(value=True)
         self.recursive_var = tk.BooleanVar(value=False)
         self.thresh_var = tk.IntVar(value=150)
-        self.sens_var = tk.DoubleVar(value=0.1)
+        self.sens_var = tk.DoubleVar(value=0.05)
 
         pad = {"padx": 10, "pady": 4}
         ttk.Label(self, text="Folders to process (a 'backup' folder is created inside each):").pack(anchor="w", **pad)
@@ -32,6 +33,7 @@ class App(tk.Tk):
         btns = ttk.Frame(row)
         btns.pack(side="left", padx=(8, 0), anchor="n")
         ttk.Button(btns, text="Add folder…", command=self.add_folder).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Add path (UNC)…", command=self.add_path).pack(fill="x", pady=2)
         ttk.Button(btns, text="Remove", command=self.remove_selected).pack(fill="x", pady=2)
         ttk.Button(btns, text="Clear", command=lambda: self.listbox.delete(0, "end")).pack(fill="x", pady=2)
 
@@ -43,7 +45,7 @@ class App(tk.Tk):
         ttk.Label(opts, text="Crop threshold (0-255):").grid(row=1, column=0, sticky="w", padx=8, pady=2)
         ttk.Spinbox(opts, from_=0, to=255, textvariable=self.thresh_var, width=6).grid(row=1, column=1, sticky="w", padx=8)
         ttk.Label(opts, text="Blank sensitivity (% content):").grid(row=2, column=0, sticky="w", padx=8, pady=2)
-        ttk.Spinbox(opts, from_=0.0, to=5.0, increment=0.05, textvariable=self.sens_var, width=6).grid(row=2, column=1, sticky="w", padx=8)
+        ttk.Spinbox(opts, from_=0.0, to=5.0, increment=0.01, textvariable=self.sens_var, width=6).grid(row=2, column=1, sticky="w", padx=8)
         ttk.Label(opts, text="Higher = more pages treated as blank", foreground="gray").grid(row=2, column=2, sticky="w", padx=8)
 
         ctl = ttk.Frame(self)
@@ -66,6 +68,17 @@ class App(tk.Tk):
     def add_folder(self):
         d = filedialog.askdirectory(title="Select image folder")
         if d and d not in self.listbox.get(0, "end"):
+            self.listbox.insert("end", d)
+
+    def add_path(self):
+        d = simpledialog.askstring(
+            "Add path", r"Folder path (local or UNC, e.g. \\192.168.1.10\scans):", parent=self)
+        if not d:
+            return
+        d = processor.normalize_path(d)
+        if not os.path.isdir(d):
+            messagebox.showerror("Not reachable", f"Cannot access folder:\n{d}")
+        elif d not in self.listbox.get(0, "end"):
             self.listbox.insert("end", d)
 
     def remove_selected(self):
@@ -110,7 +123,7 @@ class App(tk.Tk):
                 continue
             self.q.put(("log", f"   {s['total']} images: {s['cropped']} cropped, "
                                f"{s['unchanged']} unchanged, {s['blank_removed']} blank removed, "
-                               f"{s['failed']} failed. Backup: {s['backup_dir']}"))
+                               f"{s['failed']} failed. Backup: {s['backup_dir']}. Blanks: {s['blank_backup_dir']}"))
             for err in s["errors"]:
                 self.q.put(("log", f"   ! {err}"))
         self.q.put(("done", self.cancel.is_set()))
