@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyInstaller output
+build/
+dist/
+*.spec
+
+# Tool output created next to processed images
+backup/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
