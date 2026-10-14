@@ -163,9 +163,11 @@ def _save(frames, path, dpi, ext):
 def process_image(path, folder, backup_dir, threshold, sensitivity, remove_blank, do_crop,
                   logger=None):
     """Backup then process one image. Returns a result dict."""
-    def log(op, status="", pages=None, blank_pages=None, details=""):
+    def log(op, status="", pages=None, blank_pages=None, details="",
+            disposition="", dropped_pages=""):
         if logger:
-            logger.log(op, folder, rel, status, pages, blank_pages, details)
+            logger.log(op, folder, rel, status, pages, blank_pages, details,
+                       disposition, dropped_pages)
 
     rel = path.relative_to(folder)
     backup_path = backup_dir / rel
@@ -180,7 +182,7 @@ def process_image(path, folder, backup_dir, threshold, sensitivity, remove_blank
     with Image.open(backup_path) as img:
         n = getattr(img, "n_frames", 1)
         dpi = img.info.get("dpi")
-        kept, any_cropped, blanks = [], False, 0
+        kept, any_cropped, blanks, dropped = [], False, 0, []
         for i in range(n):
             img.seek(i)
             frame, cropped, blank = _process_frame(
@@ -188,6 +190,7 @@ def process_image(path, folder, backup_dir, threshold, sensitivity, remove_blank
             any_cropped |= cropped
             if blank:
                 blanks += 1
+                dropped.append(i + 1)
             else:
                 kept.append(frame)
 
@@ -196,25 +199,50 @@ def process_image(path, folder, backup_dir, threshold, sensitivity, remove_blank
         blank_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(backup_path, blank_path)  # original, uncropped
         path.unlink()
-        log("blank_removed", "removed", n, blanks, f"copy kept at {blank_path}")
-        return {"file": str(rel), "status": "blank_removed"}
+        log("blank_removed", "removed", n, blanks, f"copy kept at {blank_path}",
+            "dropped", ",".join(map(str, dropped)))
+        return {"file": str(rel), "status": "blank_removed", "pages": n,
+                "dropped": len(dropped), "kept": 0}
 
     if any_cropped or blanks:
         _save(kept, path, dpi, path.suffix.lower())
         status = "cropped" if any_cropped else "unchanged"
         if blanks:
             status += f" (+{blanks} blank page(s) dropped)"
-        log("crop" if any_cropped else "blank_pages_dropped", status, n, blanks)
-        return {"file": str(rel), "status": status}
+        log("crop" if any_cropped else "blank_pages_dropped", status, n, blanks,
+            disposition="partially_dropped" if blanks else "kept",
+            dropped_pages=",".join(map(str, dropped)))
+        return {"file": str(rel), "status": status, "pages": n,
+                "dropped": len(dropped), "kept": len(kept)}
 
     if path.read_bytes() != backup_path.read_bytes():
         shutil.copy2(backup_path, path)
-    log("unchanged", "unchanged", n, 0)
-    return {"file": str(rel), "status": "unchanged"}
+    log("unchanged", "unchanged", n, 0, disposition="kept")
+    return {"file": str(rel), "status": "unchanged", "pages": n, "dropped": 0, "kept": n}
+
+
+def _tally(stats, path, res):
+    """Update drop/keep and TIFF counters from one image result (call under lock)."""
+    name = res["file"]
+    if res["kept"] == 0:
+        stats["files_dropped"].append(name)
+    elif res["dropped"]:
+        stats["files_partial"].append(name)
+    else:
+        stats["files_kept"].append(name)
+    stats["pages_dropped"] += res["dropped"]
+    if path.suffix.lower() in (".tif", ".tiff"):
+        stats["tiff_files"] += 1
+        stats["tiff_pages"] += res["pages"]
+        stats["tiff_pages_dropped"] += res["dropped"]
+        if res["kept"] == 0:
+            stats["tiff_files_dropped"] += 1
+        elif res["dropped"]:
+            stats["tiff_files_partial"] += 1
 
 
 def process_folder(folder, threshold=150, sensitivity=0.05, remove_blank=True,
-                   do_crop=True, recursive=False, progress_cb=None, cancel_check=None, logger=None):
+                   do_crop=True, recursive=False, workers=None, progress_cb=None, cancel_check=None, logger=None):
     folder = Path(normalize_path(folder))
     if not folder.is_dir():
         if logger:
@@ -228,7 +256,11 @@ def process_folder(folder, threshold=150, sensitivity=0.05, remove_blank=True,
             f"images={total} crop={do_crop} blank={remove_blank} recursive={recursive} "
             f"threshold={threshold} sensitivity={sensitivity}"))
     stats = {"total": total, "cropped": 0, "unchanged": 0, "blank_removed": 0,
-             "failed": 0, "errors": [], "backup_dir": str(folder / BACKUP_DIR_NAME),
+             "failed": 0, "errors": [],
+             "tiff_files": 0, "tiff_pages": 0, "tiff_pages_dropped": 0,
+             "tiff_files_dropped": 0, "tiff_files_partial": 0,
+             "pages_dropped": 0, "files_dropped": [], "files_kept": [],
+             "files_partial": [], "backup_dir": str(folder / BACKUP_DIR_NAME),
              "blank_backup_dir": str(folder / BLANK_BACKUP_DIR_NAME)}
     if total == 0:
         if logger:
@@ -252,7 +284,7 @@ def process_folder(folder, threshold=150, sensitivity=0.05, remove_blank=True,
                 logger.log("error", folder, p.relative_to(folder), "failed", details=str(e))
             return p, None, str(e)
 
-    workers = min(8, max(1, (os.cpu_count() or 2)))
+    workers = max(1, int(workers)) if workers else min(8, os.cpu_count() or 2)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         for fut in concurrent.futures.as_completed([ex.submit(work, p) for p in images]):
             p, res, err = fut.result()
@@ -263,16 +295,22 @@ def process_folder(folder, threshold=150, sensitivity=0.05, remove_blank=True,
                 elif err:
                     stats["failed"] += 1
                     stats["errors"].append(f"{p.name}: {err}")
-                elif res["status"] == "blank_removed":
-                    stats["blank_removed"] += 1
-                elif res["status"].startswith("cropped"):
-                    stats["cropped"] += 1
                 else:
-                    stats["unchanged"] += 1
+                    _tally(stats, p, res)
+                    if res["status"] == "blank_removed":
+                        stats["blank_removed"] += 1
+                    elif res["status"].startswith("cropped"):
+                        stats["cropped"] += 1
+                    else:
+                        stats["unchanged"] += 1
             if progress_cb:
                 progress_cb(done, total, p.name if not err else f"{p.name} (error)")
     if logger:
         logger.log("folder_end", folder, status="cancelled" if stats.get("cancelled") else "finished",
                    details=(f"total={total} cropped={stats['cropped']} unchanged={stats['unchanged']} "
-                            f"blank_removed={stats['blank_removed']} failed={stats['failed']}"))
+                            f"blank_removed={stats['blank_removed']} failed={stats['failed']} "
+                            f"tiff_files={stats['tiff_files']} tiff_pages={stats['tiff_pages']} "
+                            f"tiff_pages_dropped={stats['tiff_pages_dropped']} "
+                            f"tiff_files_dropped={stats['tiff_files_dropped']} "
+                            f"tiff_files_partial={stats['tiff_files_partial']}"))
     return stats

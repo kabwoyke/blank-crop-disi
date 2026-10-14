@@ -26,6 +26,7 @@ class App(tk.Tk):
         self.recursive_var = tk.BooleanVar(value=False)
         self.thresh_var = tk.IntVar(value=150)
         self.sens_var = tk.DoubleVar(value=0.05)
+        self.threads_var = tk.IntVar(value=min(8, os.cpu_count() or 2))
 
         pad = {"padx": 10, "pady": 4}
         ttk.Label(self, text="Folders to process (a 'backup' folder is created inside each):").pack(anchor="w", **pad)
@@ -70,6 +71,9 @@ class App(tk.Tk):
             r, c = 2 + i // 2, (i % 2) * 2
             ttk.Label(lg, text=label + ":").grid(row=r, column=c, sticky="w", padx=8, pady=1)
             ttk.Entry(lg, textvariable=self.db_vars[k], width=w, show=show).grid(row=r, column=c + 1, sticky="w", padx=4)
+
+        ttk.Label(opts, text="Worker threads:").grid(row=3, column=0, sticky="w", padx=8, pady=2)
+        ttk.Spinbox(opts, from_=1, to=32, textvariable=self.threads_var, width=6).grid(row=3, column=1, sticky="w", padx=8)
 
         ctl = ttk.Frame(self)
         ctl.pack(fill="x", **pad)
@@ -147,7 +151,7 @@ class App(tk.Tk):
             return
         opts = dict(threshold=self.thresh_var.get(), sensitivity=self.sens_var.get(),
                     remove_blank=self.blank_var.get(), do_crop=self.crop_var.get(),
-                    recursive=self.recursive_var.get())
+                    recursive=self.recursive_var.get(), workers=self.threads_var.get())
         mysql = None
         if self.mysql_var.get():
             mysql = {k: v.get().strip() if k != "password" else v.get() for k, v in self.db_vars.items()}
@@ -185,7 +189,10 @@ class App(tk.Tk):
                 continue
             self.q.put(("log", f"   {s['total']} images: {s['cropped']} cropped, "
                                f"{s['unchanged']} unchanged, {s['blank_removed']} blank removed, "
-                               f"{s['failed']} failed. Backup: {s['backup_dir']}. Blanks: {s['blank_backup_dir']}"))
+                               f"{s['failed']} failed. TIFF: {s['tiff_files']} files, {s['tiff_pages']} pages, "
+                               f"{s['tiff_pages_dropped']} pages dropped "
+                               f"({s['tiff_files_dropped']} files fully, {s['tiff_files_partial']} partly). "
+                               f"Backup: {s['backup_dir']}. Blanks: {s['blank_backup_dir']}"))
             for err in s["errors"]:
                 self.q.put(("log", f"   ! {err}"))
         logger.log("run_end", status="cancelled" if self.cancel.is_set() else "finished")

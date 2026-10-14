@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime
 
 COLUMNS = ["timestamp", "run_id", "folder", "operation", "file", "status",
-           "pages", "blank_pages", "details"]
+           "file_type", "disposition", "pages", "blank_pages", "dropped_pages", "details"]
 
 TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS operation_log (
@@ -26,8 +26,11 @@ CREATE TABLE IF NOT EXISTS operation_log (
     operation VARCHAR(32) NOT NULL,
     file VARCHAR(1024),
     status VARCHAR(128),
+    file_type VARCHAR(16) NULL,
+    disposition VARCHAR(24) NULL,
     pages INT NULL,
     blank_pages INT NULL,
+    dropped_pages VARCHAR(512) NULL,
     details TEXT,
     INDEX idx_run (run_id),
     INDEX idx_ts (ts)
@@ -35,8 +38,14 @@ CREATE TABLE IF NOT EXISTS operation_log (
 """
 
 INSERT_SQL = ("INSERT INTO operation_log "
-              "(ts, run_id, folder, operation, file, status, pages, blank_pages, details) "
-              "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)")
+              "(ts, run_id, folder, operation, file, status, file_type, disposition, "
+              "pages, blank_pages, dropped_pages, details) "
+              "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
+
+# Columns added after the first release; applied to pre-existing tables.
+MIGRATIONS = ["ALTER TABLE operation_log ADD COLUMN file_type VARCHAR(16) NULL",
+              "ALTER TABLE operation_log ADD COLUMN disposition VARCHAR(24) NULL",
+              "ALTER TABLE operation_log ADD COLUMN dropped_pages VARCHAR(512) NULL"]
 
 
 def default_log_dir():
@@ -76,6 +85,11 @@ class OperationLogger:
                 autocommit=True, connect_timeout=10)
             with self._db.cursor() as cur:
                 cur.execute(TABLE_SQL)
+                for sql in MIGRATIONS:
+                    try:
+                        cur.execute(sql)
+                    except Exception:
+                        pass  # column already exists
         except Exception as e:
             self._db = None
             self.warn_cb(f"MySQL logging disabled: {e}")
@@ -85,12 +99,13 @@ class OperationLogger:
         return self._db is not None
 
     def log(self, operation, folder="", file="", status="", pages=None,
-            blank_pages=None, details=""):
+            blank_pages=None, details="", disposition="", dropped_pages=""):
         now = datetime.now()
+        file_type = os.path.splitext(str(file))[1].lower().lstrip(".")
         row = [now.isoformat(sep=" ", timespec="milliseconds"), self.run_id,
-               str(folder), operation, str(file), status,
+               str(folder), operation, str(file), status, file_type, disposition,
                "" if pages is None else pages,
-               "" if blank_pages is None else blank_pages, details]
+               "" if blank_pages is None else blank_pages, dropped_pages, details]
         with self._lock:
             try:
                 self._csv.writerow(row)
@@ -102,7 +117,9 @@ class OperationLogger:
                     with self._db.cursor() as cur:
                         cur.execute(INSERT_SQL, (
                             now, self.run_id, str(folder)[:1024], operation,
-                            str(file)[:1024], status[:128], pages, blank_pages, details))
+                            str(file)[:1024], status[:128], file_type or None,
+                            disposition or None, pages, blank_pages,
+                            dropped_pages or None, details))
                 except Exception as e:
                     self.warn_cb(f"MySQL logging disabled: {e}")
                     try:
