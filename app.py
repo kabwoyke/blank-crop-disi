@@ -1,18 +1,22 @@
 """Simple UI: add folders, run backup + auto-crop + blank page removal."""
+import json
 import os
 import queue
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import oplog
 import processor
+
+SETTINGS_FILE = os.path.join(oplog.default_log_dir(), "settings.json")
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Auto Crop & Blank Page Remover")
-        self.geometry("720x560")
+        self.geometry("720x680")
         self.q = queue.Queue()
         self.cancel = threading.Event()
         self.worker = None
@@ -47,6 +51,25 @@ class App(tk.Tk):
         ttk.Label(opts, text="Blank sensitivity (% content):").grid(row=2, column=0, sticky="w", padx=8, pady=2)
         ttk.Spinbox(opts, from_=0.0, to=5.0, increment=0.01, textvariable=self.sens_var, width=6).grid(row=2, column=1, sticky="w", padx=8)
         ttk.Label(opts, text="Higher = more pages treated as blank", foreground="gray").grid(row=2, column=2, sticky="w", padx=8)
+
+        lg = ttk.LabelFrame(self, text="Operation log (CSV always; MySQL optional)")
+        lg.pack(fill="x", **pad)
+        saved = self.load_settings()
+        self.mysql_var = tk.BooleanVar(value=saved.get("enabled", False))
+        self.logdir_var = tk.StringVar(value=saved.get("log_dir", oplog.default_log_dir()))
+        self.db_vars = {k: tk.StringVar(value=saved.get(k, d)) for k, d in
+                        [("host", "localhost"), ("port", "3306"), ("user", "root"),
+                         ("password", ""), ("database", "")]}
+        ttk.Label(lg, text="CSV folder:").grid(row=0, column=0, sticky="w", padx=8, pady=2)
+        ttk.Entry(lg, textvariable=self.logdir_var, width=44).grid(row=0, column=1, columnspan=3, sticky="we", padx=4)
+        ttk.Button(lg, text="Browse…", command=self.pick_logdir).grid(row=0, column=4, padx=4)
+        ttk.Checkbutton(lg, text="Log to MySQL", variable=self.mysql_var).grid(row=1, column=0, sticky="w", padx=8)
+        for i, (k, label, w, show) in enumerate([("host", "Host", 16, ""), ("port", "Port", 6, ""),
+                                                  ("user", "User", 16, ""), ("password", "Password", 16, "*"),
+                                                  ("database", "Database", 16, "")]):
+            r, c = 2 + i // 2, (i % 2) * 2
+            ttk.Label(lg, text=label + ":").grid(row=r, column=c, sticky="w", padx=8, pady=1)
+            ttk.Entry(lg, textvariable=self.db_vars[k], width=w, show=show).grid(row=r, column=c + 1, sticky="w", padx=4)
 
         ctl = ttk.Frame(self)
         ctl.pack(fill="x", **pad)
@@ -85,6 +108,28 @@ class App(tk.Tk):
         for i in reversed(self.listbox.curselection()):
             self.listbox.delete(i)
 
+    def pick_logdir(self):
+        d = filedialog.askdirectory(title="Select log folder")
+        if d:
+            self.logdir_var.set(d)
+
+    def load_settings(self):
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def save_settings(self):
+        data = {k: v.get() for k, v in self.db_vars.items() if k != "password"}
+        data.update(enabled=self.mysql_var.get(), log_dir=self.logdir_var.get())
+        try:
+            os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
     # -- run --------------------------------------------------------------
     def write(self, msg):
         self.log.configure(state="normal")
@@ -103,13 +148,30 @@ class App(tk.Tk):
         opts = dict(threshold=self.thresh_var.get(), sensitivity=self.sens_var.get(),
                     remove_blank=self.blank_var.get(), do_crop=self.crop_var.get(),
                     recursive=self.recursive_var.get())
+        mysql = None
+        if self.mysql_var.get():
+            mysql = {k: v.get().strip() if k != "password" else v.get() for k, v in self.db_vars.items()}
+            if not (mysql["host"] and mysql["user"] and mysql["database"]):
+                messagebox.showinfo("MySQL", "Host, user and database are required for MySQL logging.")
+                return
+        try:
+            logger = oplog.OperationLogger(
+                self.logdir_var.get().strip() or None, mysql,
+                warn_cb=lambda m: self.q.put(("log", f"   ! {m}")))
+        except Exception as e:
+            messagebox.showerror("Log file", f"Cannot create log file:\n{e}")
+            return
+        self.save_settings()
+        self.write(f"Log: {logger.csv_path}" + (" + MySQL" if logger.mysql_active else ""))
         self.cancel.clear()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.worker = threading.Thread(target=self.run_all, args=(folders, opts), daemon=True)
+        self.worker = threading.Thread(target=self.run_all, args=(folders, opts, logger), daemon=True)
         self.worker.start()
 
-    def run_all(self, folders, opts):
+    def run_all(self, folders, opts, logger):
+        logger.log("run_start", status="started", details=(
+            f"folders={len(folders)} " + " ".join(f"{k}={v}" for k, v in opts.items())))
         for folder in folders:
             if self.cancel.is_set():
                 break
@@ -117,7 +179,7 @@ class App(tk.Tk):
             try:
                 s = processor.process_folder(
                     folder, progress_cb=lambda d, t, n: self.q.put(("progress", d, t, n)),
-                    cancel_check=self.cancel.is_set, **opts)
+                    cancel_check=self.cancel.is_set, logger=logger, **opts)
             except Exception as e:
                 self.q.put(("log", f"   ERROR: {e}"))
                 continue
@@ -126,6 +188,8 @@ class App(tk.Tk):
                                f"{s['failed']} failed. Backup: {s['backup_dir']}. Blanks: {s['blank_backup_dir']}"))
             for err in s["errors"]:
                 self.q.put(("log", f"   ! {err}"))
+        logger.log("run_end", status="cancelled" if self.cancel.is_set() else "finished")
+        logger.close()
         self.q.put(("done", self.cancel.is_set()))
 
     def poll(self):

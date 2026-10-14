@@ -160,13 +160,21 @@ def _save(frames, path, dpi, ext):
             tmp.unlink()
 
 
-def process_image(path, folder, backup_dir, threshold, sensitivity, remove_blank, do_crop):
+def process_image(path, folder, backup_dir, threshold, sensitivity, remove_blank, do_crop,
+                  logger=None):
     """Backup then process one image. Returns a result dict."""
+    def log(op, status="", pages=None, blank_pages=None, details=""):
+        if logger:
+            logger.log(op, folder, rel, status, pages, blank_pages, details)
+
     rel = path.relative_to(folder)
     backup_path = backup_dir / rel
     backup_path.parent.mkdir(parents=True, exist_ok=True)
     if not backup_path.exists():  # keep the true original from the first run
         shutil.copy2(path, backup_path)
+        log("backup", "created", details=str(backup_path))
+    else:
+        log("backup", "already_exists", details=str(backup_path))
 
     # Always read from the backup so reruns start from the original.
     with Image.open(backup_path) as img:
@@ -188,6 +196,7 @@ def process_image(path, folder, backup_dir, threshold, sensitivity, remove_blank
         blank_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(backup_path, blank_path)  # original, uncropped
         path.unlink()
+        log("blank_removed", "removed", n, blanks, f"copy kept at {blank_path}")
         return {"file": str(rel), "status": "blank_removed"}
 
     if any_cropped or blanks:
@@ -195,25 +204,35 @@ def process_image(path, folder, backup_dir, threshold, sensitivity, remove_blank
         status = "cropped" if any_cropped else "unchanged"
         if blanks:
             status += f" (+{blanks} blank page(s) dropped)"
+        log("crop" if any_cropped else "blank_pages_dropped", status, n, blanks)
         return {"file": str(rel), "status": status}
 
     if path.read_bytes() != backup_path.read_bytes():
         shutil.copy2(backup_path, path)
+    log("unchanged", "unchanged", n, 0)
     return {"file": str(rel), "status": "unchanged"}
 
 
 def process_folder(folder, threshold=150, sensitivity=0.05, remove_blank=True,
-                   do_crop=True, recursive=False, progress_cb=None, cancel_check=None):
+                   do_crop=True, recursive=False, progress_cb=None, cancel_check=None, logger=None):
     folder = Path(normalize_path(folder))
     if not folder.is_dir():
+        if logger:
+            logger.log("folder_error", folder, status="not_a_folder")
         raise NotADirectoryError(f"Not a folder: {folder}")
 
     images = list_images(folder, recursive)
     total = len(images)
+    if logger:
+        logger.log("folder_start", folder, status="started", details=(
+            f"images={total} crop={do_crop} blank={remove_blank} recursive={recursive} "
+            f"threshold={threshold} sensitivity={sensitivity}"))
     stats = {"total": total, "cropped": 0, "unchanged": 0, "blank_removed": 0,
              "failed": 0, "errors": [], "backup_dir": str(folder / BACKUP_DIR_NAME),
              "blank_backup_dir": str(folder / BLANK_BACKUP_DIR_NAME)}
     if total == 0:
+        if logger:
+            logger.log("folder_end", folder, status="no_images")
         return stats
 
     backup_dir = folder / BACKUP_DIR_NAME
@@ -227,8 +246,10 @@ def process_folder(folder, threshold=150, sensitivity=0.05, remove_blank=True,
             return p, None, "cancelled"
         try:
             return p, process_image(p, folder, backup_dir, threshold, sensitivity,
-                                    remove_blank, do_crop), None
+                                    remove_blank, do_crop, logger), None
         except Exception as e:
+            if logger:
+                logger.log("error", folder, p.relative_to(folder), "failed", details=str(e))
             return p, None, str(e)
 
     workers = min(8, max(1, (os.cpu_count() or 2)))
@@ -250,4 +271,8 @@ def process_folder(folder, threshold=150, sensitivity=0.05, remove_blank=True,
                     stats["unchanged"] += 1
             if progress_cb:
                 progress_cb(done, total, p.name if not err else f"{p.name} (error)")
+    if logger:
+        logger.log("folder_end", folder, status="cancelled" if stats.get("cancelled") else "finished",
+                   details=(f"total={total} cropped={stats['cropped']} unchanged={stats['unchanged']} "
+                            f"blank_removed={stats['blank_removed']} failed={stats['failed']}"))
     return stats
